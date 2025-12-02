@@ -1,0 +1,139 @@
+
+improved version of Option 1 that correctly handles dict values (including nested dicts, lists of dicts, lists of dataclasses, and mixed nesting). It returns a mapping of MongoDB dot-path → value.
+
+Key behaviors:
+
+Recurses into dataclass, dict, and list values.
+
+Lists produce numeric path segments (events.0.amount).
+
+Skips None values by default (configurable with skip_none=False).
+
+Note: MongoDB field names must not contain . or start with $. If your dict keys contain dots you should sanitize them before storing (I added a small optional sanitizer hook).
+
+
+
+
+from dataclasses import is_dataclass, fields
+from typing import Any, Callable, Dict
+
+def _default_sanitize_key(key: str) -> str:
+    # replace dots with the unicode full stop so Mongo won't complain.
+    # You can customize this function if you prefer a different strategy.
+    return key.replace(".", "\uFF0E")
+
+def dataclass_to_mongo_paths(
+    obj: Any,
+    prefix: str = "",
+    paths: Dict[str, Any] = None,
+    skip_none: bool = True,
+    sanitize_key: Callable[[str], str] = _default_sanitize_key,
+) -> Dict[str, Any]:
+    """
+    Recursively build dot-paths for dataclass, dicts and lists.
+
+    Args:
+        obj: dataclass instance, dict, list or primitive
+        prefix: internal recursion prefix (do not pass normally)
+        paths: internal accumulator
+        skip_none: if True, do not include None values in result
+        sanitize_key: function to sanitize dict keys (e.g. replace '.')
+
+    Returns:
+        dict mapping 'a.b.0.c' -> value
+    """
+    if paths is None:
+        paths = {}
+
+    # Helper to add final primitive value
+    def _add(path: str, value: Any):
+        if skip_none and value is None:
+            return
+        # remove trailing dot if any
+        p = path[:-1] if path.endswith(".") else path
+        paths[p] = value
+
+    # Dataclass: iterate fields
+    if is_dataclass(obj):
+        for f in fields(obj):
+            val = getattr(obj, f.name)
+            new_prefix = f"{prefix}{f.name}."
+            dataclass_to_mongo_paths(val, new_prefix, paths, skip_none, sanitize_key)
+        return paths
+
+    # Dict: iterate keys (sanitize keys for Mongo field safety)
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            safe_k = sanitize_key(k) if sanitize_key else k
+            new_prefix = f"{prefix}{safe_k}."
+            dataclass_to_mongo_paths(v, new_prefix, paths, skip_none, sanitize_key)
+        return paths
+
+    # List / tuple: enumerate items and index them
+    if isinstance(obj, (list, tuple)):
+        for i, item in enumerate(obj):
+            new_prefix = f"{prefix}{i}."
+            dataclass_to_mongo_paths(item, new_prefix, paths, skip_none, sanitize_key)
+        return paths
+
+    # Primitive
+    _add(prefix, obj)
+    return paths
+
+
+
+
+
+
+
+Notes & suggestions
+
+I sanitize keys that contain . by default (replaces . with U+FF0E). You can replace _default_sanitize_key with another strategy or pass sanitize_key=None to preserve keys as-is (be careful — Mongo will reject dots in field names).
+
+If you want the function to return only paths (no values), we can provide a variant.
+
+If you want to produce update documents directly ({"$set": {...}}) or handle flattening for $push/array positional updates, I can extend this.
+
+Want me to adapt this to: (a) preserve original . in keys by mapping them to bracket notation, (b) produce an inverse function (dot-paths -> nested object), or (c) generate a $set document ready for update_one?
+
+
+
+
+--------------------------------
+
+Option 1 — Recursive function to generate MongoDB dot paths
+from dataclasses import is_dataclass, fields
+from typing import Any
+
+def dataclass_to_mongo_paths(obj, prefix=""):
+    paths = {}
+
+    if is_dataclass(obj):
+        for f in fields(obj):
+            value = getattr(obj, f.name)
+            key = f"{prefix}{f.name}"
+
+            # Nested dataclass
+            if is_dataclass(value):
+                paths.update(dataclass_to_mongo_paths(value, key + "."))
+            # List handling
+            elif isinstance(value, list):
+                for i, item in enumerate(value):
+                    list_prefix = f"{key}.{i}."
+                    if is_dataclass(item):
+                        paths.update(dataclass_to_mongo_paths(item, list_prefix))
+                    else:
+                        paths[f"{key}.{i}"] = item
+            # Primitive
+            else:
+                paths[key] = value
+
+    else:
+        # Not a dataclass (primitive)
+        paths[prefix[:-1]] = obj
+
+    return paths
+
+
+
+
