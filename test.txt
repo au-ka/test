@@ -1,259 +1,55 @@
-import uuid
-from datetime import date
+from functools import wraps
+import time
 
-# --- Imports ---
-from cdm.event.common.Trade import Trade
-from cdm.product.template.NonTransferableProduct import NonTransferableProduct
-from cdm.product.template.TradeLot import TradeLot
-from cdm.product.template.TradableProduct import TradableProduct
-from cdm.product.template.EconomicTerms import EconomicTerms
-from cdm.product.template.Payout import Payout
+class ConflictError(Exception):
+    def __init__(self, remaining):
+        super().__init__("Conflict detected in bulk update")
+        self.remaining = remaining
 
-from cdm.product.asset.InterestRatePayout import InterestRatePayout
-from cdm.product.common.schedule.CalculationPeriodDates import CalculationPeriodDates
-from cdm.product.common.schedule.PaymentDates import PaymentDates
+def retry_conflicts(max_retries=3, delay=0.05):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            attempts = 0
 
-from cdm.product.asset.FixedRateSpecification import FixedRateSpecification
-from cdm.product.asset.FloatingRateSpecification import FloatingRateSpecification
-from cdm.product.asset.RateSpecification import RateSpecification
-from cdm.product.common.schedule.RateSchedule import RateSchedule
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                
+                except ConflictError as e:
+                    attempts += 1
+                    remaining = e.remaining
 
-from cdm.observable.asset.PriceSchedule import PriceSchedule
-from cdm.observable.asset.PriceQuantity import PriceQuantity
-from cdm.base.math.NonNegativeQuantitySchedule import NonNegativeQuantitySchedule
-from cdm.observable.asset.PriceTypeEnum import PriceTypeEnum
+                    if attempts > max_retries:
+                        raise  # give up after retries
+                    
+                    # retry only for remaining trades
+                    kwargs["trades"] = remaining
+                    time.sleep(delay)
 
-from cdm.base.staticdata.party.Party import Party
-from cdm.base.staticdata.party.PartyIdentifier import PartyIdentifier
-from cdm.base.staticdata.identifier.AssignedIdentifier import AssignedIdentifier
-from cdm.base.staticdata.party.Counterparty import Counterparty
-from cdm.base.staticdata.party.CounterpartyRoleEnum import CounterpartyRoleEnum
-from cdm.base.staticdata.party.PayerReceiver import PayerReceiver
-
-from cdm.base.staticdata.asset.rates.FloatingRateIndexEnum import FloatingRateIndexEnum
-from cdm.observable.asset.FloatingRateIndex import FloatingRateIndex
-from cdm.observable.asset.InterestRateIndex import InterestRateIndex
-from cdm.base.staticdata.asset.common.AssetIdentifier import AssetIdentifier
-from cdm.base.staticdata.asset.common.AssetIdTypeEnum import AssetIdTypeEnum
-from cdm.base.datetime.Period import Period
-from cdm.base.datetime.daycount.DayCountFractionEnum import DayCountFractionEnum
+        return wrapper
+    return decorator
 
 
 
-from cdm.event.common.TradeIdentifier import TradeIdentifier
+@retry_conflicts(max_retries=3)
+def update_trades(self, trades):
+    bulk_ops = []
 
-def createTrade(notionalAmount):
-
-
-    # ============================
-    # 1) Parties WITH meta (@key)
-    # ============================
-
-    party_a = Party(
-        meta={"@key": "Party1"},
-        partyId=[
-            PartyIdentifier(
-                identifier="Party1",
-                assignedIdentifier=[AssignedIdentifier(identifier="Party1")]
-            )
-        ]
-    )
-
-    party_b = Party(
-        meta={"@key": "Party2"},
-        partyId=[
-            PartyIdentifier(
-                identifier="Party2",
-                assignedIdentifier=[AssignedIdentifier(identifier="Party2")]
-            )
-        ]
-    )
-
-    # payer/receiver
-    payer_receiver_fixed = PayerReceiver(
-        payer=CounterpartyRoleEnum.PARTY_1,
-        receiver=CounterpartyRoleEnum.PARTY_2
-    )
-    payer_receiver_float = PayerReceiver(
-        payer=CounterpartyRoleEnum.PARTY_2,
-        receiver=CounterpartyRoleEnum.PARTY_1
-    )
-
-    # ============================
-    # 2) Fixed Rate Leg
-    # ============================
-
-    fixed_rate_spec = FixedRateSpecification(
-        rateSchedule=RateSchedule(
-            price=PriceSchedule(
-                value=0.025,
-                priceType=PriceTypeEnum.INTEREST_RATE
+    for t in trades:
+        bulk_ops.append(
+            UpdateOne(
+                {"tradeId": t.tradeId, "version": t.version},
+                {"$set": t.to_dict()}
             )
         )
-    )
 
-    fixed_leg = InterestRatePayout(
-        payerReceiver=payer_receiver_fixed,
-        rateSpecification=RateSpecification(
-            fixedRateSpecification=fixed_rate_spec
-        ),
-        calculationPeriodDates=CalculationPeriodDates(
-            effectiveDate={"unadjustedDate": "2025-10-23"},
-            terminationDate={"unadjustedDate": "2030-10-23"},
-            calculationPeriodFrequency={
-                "periodMultiplier": 6,
-                "period": "M",
-                "rollConvention": "NONE"
-            }
-        ),
-        paymentDates=PaymentDates(
-            paymentFrequency={"periodMultiplier": 6, "period": "M"},
-            payRelativeTo="CalculationPeriodEndDate"
-        ),
-        dayCountFraction=DayCountFractionEnum.ACT_360,
-        notionalSchedule=PriceSchedule(value=notionalAmount, priceType=PriceTypeEnum.ASSET_PRICE)
-    )
+    result = self.collection.bulk_write(bulk_ops, ordered=False)
 
-    # ============================
-    # 3) Floating Rate Leg
-    # ============================
+    # Example conflict detection
+    if result.modified_count != len(trades):
+        success_ids = {op._filter["tradeId"] for op in bulk_ops if op._filter.get("tradeId")}
+        failed = [t for t in trades if t.tradeId not in success_ids]
+        raise ConflictError(failed)
 
-    ait = AssetIdentifier(identifier="floatingRateIndex", identifierType=AssetIdTypeEnum.OTHER)
-    tenor = Period(periodMultiplier=3, period="M")
-
-    fri = FloatingRateIndex(
-        identifier=[ait],
-        floatingRateIndex=FloatingRateIndexEnum.USD_SOFR_COMPOUND,
-        indexTenor=tenor
-    )
-
-    ro = InterestRateIndex(floatingRateIndex=fri)
-
-    floating_rate_spec = FloatingRateSpecification(rateOption=ro)
-
-    floating_leg = InterestRatePayout(
-        payerReceiver=payer_receiver_float,
-        rateSpecification=RateSpecification(floatingRateSpecification=floating_rate_spec),
-        calculationPeriodDates=CalculationPeriodDates(
-            effectiveDate={"unadjustedDate": "2025-10-23"},
-            terminationDate={"unadjustedDate": "2030-10-23"},
-            calculationPeriodFrequency={
-                "periodMultiplier": 3,
-                "period": "M",
-                "rollConvention": "NONE"
-            }
-        ),
-        paymentDates=PaymentDates(
-            paymentFrequency={"periodMultiplier": 3, "period": "M"},
-            payRelativeTo="CalculationPeriodEndDate"
-        ),
-        dayCountFraction=DayCountFractionEnum.ACT_360,
-        notionalSchedule=PriceSchedule(value=notionalAmount, priceType=PriceTypeEnum.ASSET_PRICE)
-    )
-
-    # ============================
-    # 4) Economic Terms
-    # ============================
-
-    economic_terms = EconomicTerms(
-        payout=[
-            Payout(InterestRatePayout=fixed_leg),
-            Payout(InterestRatePayout=floating_leg)
-        ]
-    )
-
-    non_transferable = NonTransferableProduct(economicTerms=economic_terms)
-
-    # ============================
-    # 5) Counterparties (MUST use @ref)
-    # ============================
-
-    counterparties = [
-        Counterparty(
-            role=CounterpartyRoleEnum.PARTY_1,
-            partyReference=party_a
-        ),
-        Counterparty(
-            role=CounterpartyRoleEnum.PARTY_2,
-            partyReference=party_b
-        )
-    ]
-
-    # ============================
-    # 6) TradeLot with correct priceQuantity
-    # ============================
-
-    quantity = NonNegativeQuantitySchedule(value=notionalAmount)
-    price_quantity = PriceQuantity(quantity=[quantity])
-
-    trade_lot = TradeLot(priceQuantity=[price_quantity])
-
-    # ============================
-    # 7) TradeIdentifier WITH meta
-    # ============================
-
-    trade_identifier = TradeIdentifier(
-        meta={"@key": "T1"},
-        assignedIdentifier=[AssignedIdentifier(identifier="123456789A")]
-    )
-
-    # ============================
-    # 8) Final Trade object
-    # ============================
-
-    trade = Trade(
-        meta={"@key": "Trade1"},
-        #party=[party_a, party_b],
-        counterparty=counterparties,
-        product=non_transferable,
-        tradeLot=[trade_lot],
-        tradeIdentifier=[trade_identifier],
-        tradeDate=date.today().isoformat()
-    )
-    return trade
-
-trade1 = createTrade(10_000_000)
-#trade2 = createTrade(10_500_000)
-
-
-
-from cdm.event.common.BusinessEvent import BusinessEvent
-from cdm.event.common.TradeState import TradeState
-from cdm.event.common.QuantityChangeInstruction import QuantityChangeInstruction
-from cdm.base.math.QuantityChangeDirectionEnum import QuantityChangeDirectionEnum
-from cdm.event.common.Instruction import Instruction
-from cdm.event.common.PrimitiveInstruction import PrimitiveInstruction
-from cdm.event.workflow.WorkflowStep import WorkflowStep
-from cdm.event.workflow.EventInstruction import EventInstruction
-from cdm.event.workflow.EventTimestamp import EventTimestamp
-from cdm.event.workflow.EventTimestampQualificationEnum import EventTimestampQualificationEnum
-import datetime
-from cdm.base.staticdata.identifier.Identifier import Identifier
-#from cdm.event.workflow.functions.Create_AcceptedWorkflowStepFromInstruction import Create_AcceptedWorkflowStepFromInstruction //throws cyclic import error
-
-# STEP 1: Put original trade into a TradeState
-original_state = TradeState(trade=trade1)
-
-
-
-quantity = NonNegativeQuantitySchedule(value=10_500_000)
-price_quantity = PriceQuantity(quantity=[quantity])
-
-quantityChangeInstruction = QuantityChangeInstruction(direction=QuantityChangeDirectionEnum.DECREASE, change=[price_quantity])
-
-primitiveInstruction = PrimitiveInstruction(quantityChange=quantityChangeInstruction)
-instruction = Instruction(before=original_state, primitiveInstruction=primitiveInstruction)
-event_instruction = EventInstruction(instruction=[instruction], eventDate=datetime.date.today())
-
-
-eventId = AssignedIdentifier(identifier="123456789A")
-worflow_step = WorkflowStep(proposedEvent=event_instruction,
-                            timestamp=[EventTimestamp(dateTime=datetime.datetime.utcnow(), qualification=EventTimestampQualificationEnum.EVENT_CREATION_DATE_TIME)],
-                            eventIdentifier=[Identifier(assignedIdentifier=[eventId])])
-
-
-import pprint
-pprint.pprint(worflow_step.model_dump(mode='json'))
-
-#step = Create_AcceptedWorkflowStepFromInstruction(worflow_step)
-#print(step)
+    return result
