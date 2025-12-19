@@ -1,55 +1,53 @@
-from functools import wraps
-import time
-
-class ConflictError(Exception):
-    def __init__(self, remaining):
-        super().__init__("Conflict detected in bulk update")
-        self.remaining = remaining
-
-def retry_conflicts(max_retries=3, delay=0.05):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            attempts = 0
-
-            while True:
-                try:
-                    return func(*args, **kwargs)
-                
-                except ConflictError as e:
-                    attempts += 1
-                    remaining = e.remaining
-
-                    if attempts > max_retries:
-                        raise  # give up after retries
-                    
-                    # retry only for remaining trades
-                    kwargs["trades"] = remaining
-                    time.sleep(delay)
-
-        return wrapper
-    return decorator
+from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import PyMongoError
+from datetime import datetime
 
 
 
-@retry_conflicts(max_retries=3)
-def update_trades(self, trades):
-    bulk_ops = []
 
-    for t in trades:
-        bulk_ops.append(
-            UpdateOne(
-                {"tradeId": t.tradeId, "version": t.version},
-                {"$set": t.to_dict()}
-            )
+
+def reserve_next_n(
+    sequence_name: str,
+    n: int
+) -> tuple[int, int]:
+    """
+    Atomically reserves next N sequence numbers.
+    Fails if counter document does not exist.
+    """
+
+    if n <= 0:
+        raise ValueError("n must be > 0")
+
+    try:
+        doc = counters.find_one_and_update(
+            {"_id": sequence_name},
+            {"$inc": {"seq": n}},
+            upsert=False,  # 👈 critical
+            return_document=ReturnDocument.AFTER
         )
 
-    result = self.collection.bulk_write(bulk_ops, ordered=False)
+        if doc is None:
+            raise RuntimeError(
+                f"Sequence '{sequence_name}' does not exist"
+            )
 
-    # Example conflict detection
-    if result.modified_count != len(trades):
-        success_ids = {op._filter["tradeId"] for op in bulk_ops if op._filter.get("tradeId")}
-        failed = [t for t in trades if t.tradeId not in success_ids]
-        raise ConflictError(failed)
+        end = doc["seq"]
+        start = end - n + 1
 
-    return result
+        return start, end
+
+    except PyMongoError as e:
+        raise RuntimeError("Failed to reserve sequence block") from e
+
+
+
+
+def generate_next_n_trade_ids(n: int) -> list[str]:
+    start, end = reserve_next_n("trade_id", n)
+
+    year = datetime.utcnow().year
+
+    return [
+        f"TRD-{year}-{seq:08d}"
+        for seq in range(start, end + 1)
+    ]
